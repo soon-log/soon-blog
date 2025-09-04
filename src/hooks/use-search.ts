@@ -1,6 +1,10 @@
+import { useSuspenseQuery } from '@tanstack/react-query';
 import lunr from 'lunr';
 import { useState, useEffect, useCallback } from 'react';
 
+import { QUERY_KEY } from '@/constants/query-key';
+import { buildAbsoluteUrl } from '@/lib/http';
+import { createEnhancedSearchQueries } from '@/lib/search';
 import { SearchResult, SearchIndexData } from '@/types/mdx';
 
 interface UseSearchResult {
@@ -8,108 +12,34 @@ interface UseSearchResult {
   setQuery: (query: string) => void;
   results: Array<SearchResult>;
   isLoading: boolean;
-  error: string | null;
+  error: Error | null;
 }
 
-/**
- * 한글 검색을 위한 쿼리 변환 함수
- * @param query - 사용자 입력 검색어
- * @returns 변환된 검색 쿼리들
- */
-function createKoreanSearchQueries(query: string): Array<string> {
-  const trimmedQuery = query.trim().toLowerCase();
-  const queries: Array<string> = [];
+const fetchSearchIndex = async () => {
+  const response = await fetch(buildAbsoluteUrl('/data/lunr-index.json'));
 
-  console.log('🔧 쿼리 변환 시작:', trimmedQuery);
-
-  // 1. 원본 쿼리
-  queries.push(trimmedQuery);
-
-  // 2. 한글이 포함된 경우 부분 문자열 쿼리 생성
-  if (/[가-힣]/.test(trimmedQuery)) {
-    console.log('🇰🇷 한글 감지됨');
-
-    // 2글자 이상인 경우 부분 문자열로도 검색
-    if (trimmedQuery.length >= 2) {
-      // 정확한 매칭을 위한 쿼리
-      queries.push(`"${trimmedQuery}"`);
-
-      // 2글자, 3글자 부분 문자열
-      for (let len = 2; len <= Math.min(3, trimmedQuery.length); len++) {
-        for (let i = 0; i <= trimmedQuery.length - len; i++) {
-          const substring = trimmedQuery.substring(i, i + len);
-          if (substring.length >= 2) {
-            queries.push(substring);
-          }
-        }
-      }
-    }
+  if (!response.ok) {
+    throw new Error(`검색 인덱스 로드 실패: ${response.status}`);
   }
 
-  // 3. 영어인 경우 와일드카드 추가
-  if (/^[a-zA-Z]+$/.test(trimmedQuery) && trimmedQuery.length >= 2) {
-    console.log('🔤 영어 감지됨, 와일드카드 추가');
-    queries.push(`${trimmedQuery}*`);
-  }
+  const data: SearchIndexData = await response.json();
 
-  const uniqueQueries = [...new Set(queries)]; // 중복 제거
-  console.log('📝 최종 검색 쿼리들:', uniqueQueries);
-  return uniqueQueries;
-}
+  return {
+    index: lunr.Index.load(data.index),
+    store: data.store
+  };
+};
 
-/**
- * Lunr.js를 사용한 검색 기능을 제공하는 훅
- */
 export function useSearch(): UseSearchResult {
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<Array<SearchResult>>([]);
-  const [isLoading, setIsLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [searchIndex, setSearchIndex] = useState<lunr.Index | null>(null);
-  const [searchStore, setSearchStore] = useState<Record<string, any>>({});
 
-  // 검색 인덱스 로드
-  useEffect(() => {
-    let isMounted = true;
+  const { data, isLoading, error } = useSuspenseQuery({
+    queryKey: QUERY_KEY.SEARCH_INDEX,
+    queryFn: fetchSearchIndex
+  });
+  const { index: searchIndex, store: searchStore } = data;
 
-    async function loadSearchIndex() {
-      setIsLoading(true);
-      setError(null);
-
-      try {
-        const response = await fetch('/data/lunr-index.json');
-
-        if (!response.ok) {
-          throw new Error(`검색 인덱스 로드 실패: ${response.status}`);
-        }
-
-        const data: SearchIndexData = await response.json();
-
-        if (isMounted) {
-          const index = lunr.Index.load(data.index);
-          setSearchIndex(index);
-          setSearchStore(data.store);
-        }
-      } catch (err) {
-        console.error('검색 인덱스 로드 실패:', err);
-        if (isMounted) {
-          setError(err instanceof Error ? err.message : '검색 인덱스 로드에 실패했습니다');
-        }
-      } finally {
-        if (isMounted) {
-          setIsLoading(false);
-        }
-      }
-    }
-
-    loadSearchIndex();
-
-    return () => {
-      isMounted = false;
-    };
-  }, []);
-
-  // 검색 실행
   const performSearch = useCallback(
     (searchQuery: string) => {
       if (!searchIndex || !searchQuery.trim()) {
@@ -118,14 +48,11 @@ export function useSearch(): UseSearchResult {
       }
 
       try {
-        const allResults: lunr.Index.Result[] = [];
+        const allResults: Array<lunr.Index.Result> = [];
         const seenResults = new Set<string>();
 
-        console.log('🔍 검색 시작:', searchQuery);
-
         // 한글 지원 검색 쿼리 생성
-        const searchQueries = createKoreanSearchQueries(searchQuery);
-        console.log('📝 생성된 검색 쿼리들:', searchQueries);
+        const searchQueries = createEnhancedSearchQueries(searchQuery);
 
         // 각 쿼리로 검색 실행
         for (const [index, queryString] of searchQueries.entries()) {
